@@ -146,6 +146,7 @@ def monitor_ec2():
                 Dimensions=[
                     {"Name": "InstanceId", "Value": inst_id},
                     {"Name": "path", "Value": "/"},
+                    {"Name": "device", "Value": "xvda1"},
                     {"Name": "fstype", "Value": "xfs"}
                 ],
                 StartTime=start,
