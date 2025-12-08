@@ -20,15 +20,13 @@ SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
 if not SNS_TOPIC_ARN:
     raise RuntimeError("SNS_TOPIC_ARN environment variable not set.")
 
-# Optional MQTT credentials via secrets
 MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 MQTT_URL = "https://dashboard.mqtt.kazam.in/#/login"
 
-# Thresholds
-CPU_THRESHOLD = 65       # %
-MEMORY_THRESHOLD = 80    # %
-DISK_THRESHOLD = 85      # %
+CPU_THRESHOLD = 65
+MEMORY_THRESHOLD = 80
+DISK_THRESHOLD = 85
 
 # AWS clients
 eb = boto3.client("elasticbeanstalk", region_name=AWS_REGION)
@@ -60,10 +58,9 @@ mqtt_instances = [
 ]
 
 # --------------------------------------------------------------------
-# Helper Functions
+# Helper Function
 # --------------------------------------------------------------------
 def get_instance_name(instance_id):
-    """Fetch EC2 instance name"""
     try:
         resp = ec2_client.describe_instances(InstanceIds=[instance_id])
         for res in resp.get("Reservations", []):
@@ -90,7 +87,7 @@ def monitor_ec2():
         utc_now = datetime.datetime.now(pytz.UTC)
         start = utc_now - datetime.timedelta(hours=6)
 
-        # --- CPU Utilization ---
+        # --- CPU ---
         try:
             cpu_data = cw.get_metric_statistics(
                 Namespace="AWS/EC2",
@@ -114,42 +111,51 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching CPU: {e}")
 
-        # --- Memory Utilization (CWAgent) ---
+        # --- Memory (Fully Dynamic CWAgent detection, no dimension filter) ---
         try:
-            mem_data = cw.get_metric_statistics(
+            mem_found = False
+            metric_list = cw.list_metrics(
                 Namespace="CWAgent",
-                MetricName="mem_used_percent",
-                Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-                StartTime=start,
-                EndTime=utc_now,
-                Period=300,
-                Statistics=["Maximum"]
+                MetricName="mem_used_percent"
             )
-            points = mem_data.get("Datapoints", [])
-            if points:
-                mem = max(p["Maximum"] for p in points)
-                print(f"  Memory Usage: {mem:.1f}%")
-                if mem > MEMORY_THRESHOLD:
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.1f}%)"})
-                else:
-                    print("  ✅ Memory OK")
-            else:
+
+            for metric in metric_list.get("Metrics", []):
+                dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
+                if dims.get("InstanceId") == inst_id:
+                    mem_data = cw.get_metric_statistics(
+                        Namespace="CWAgent",
+                        MetricName="mem_used_percent",
+                        Dimensions=metric["Dimensions"],
+                        StartTime=start,
+                        EndTime=utc_now,
+                        Period=300,
+                        Statistics=["Maximum"]
+                    )
+                    points = mem_data.get("Datapoints", [])
+                    if points:
+                        mem = max(p["Maximum"] for p in points)
+                        print(f"  Memory Usage: {mem:.1f}%")
+                        if mem > MEMORY_THRESHOLD:
+                            issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.1f}%)"})
+                        else:
+                            print("  ✅ Memory OK")
+                        mem_found = True
+                        break
+            if not mem_found:
                 print("  ⚠ No Memory data available")
         except Exception as e:
             print(f"⚠ Error fetching memory: {e}")
 
-        # --- Disk Utilization (Dynamic CWAgent Detection) ---
+        # --- Disk (Dynamic CWAgent detection) ---
         try:
             metric_list = cw.list_metrics(
                 Namespace="CWAgent",
-                MetricName="disk_used_percent",
-                Dimensions=[{"Name": "InstanceId", "Value": inst_id}]
+                MetricName="disk_used_percent"
             )
-
             disk_found = False
             for metric in metric_list.get("Metrics", []):
                 dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
-                if dims.get("path") == "/":
+                if dims.get("InstanceId") == inst_id and dims.get("path") == "/":
                     disk_data = cw.get_metric_statistics(
                         Namespace="CWAgent",
                         MetricName="disk_used_percent",
