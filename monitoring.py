@@ -7,21 +7,19 @@ from io import StringIO
 import sys
 from tabulate import tabulate
 
-# --------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------
+# ===================================================================
+# CONFIG
+# ===================================================================
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
 SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
 if not SNS_TOPIC_ARN:
     raise RuntimeError("SNS_TOPIC_ARN not set!")
 
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+CPU_WARN = 65
+CPU_CRIT = 80
+DISK_WARN = 80
+DISK_CRIT = 90
 
-CPU_THRESHOLD = 65
-DISK_THRESHOLD = 85
-
-# Skip these broken/suspended EB environments
 SKIP_EB = {"kazam-app-backend-env", "kazam-web-frontend"}
 
 eb = boto3.client("elasticbeanstalk", region_name=AWS_REGION)
@@ -31,43 +29,40 @@ ec2 = boto3.client("ec2", region_name=AWS_REGION)
 
 issues = []
 
-# Your 9 critical instances
 INSTANCES = [
-    "i-00e0f35f25480f647", "i-0c88e356ad88357b0", "i-070ed38555e983a39",  # logger mongo
-    "i-0fd0bddfa1f458b4b", "i-0b3819ce528f9cd9f", "i-051daf3ab8bc94e62",  # main mongo
-    "i-0424fb5cb4e35d2d6", "i-0f06227cd4a2e6e15", "i-0333631e1496b0fd1",  # emqx
+    "i-00e0f35f25480f647", "i-0c88e356ad88357b0", "i-070ed38555e983a39",
+    "i-0fd0bddfa1f458b4b", "i-0b3819ce528f9cd9f", "i-051daf3ab8bc94e62",
+    "i-0424fb5cb4e35d2d6", "i-0f06227cd4a2e6e15", "i-0333631e1496b0fd1",
 ]
 
 def get_name(i):
     try:
-        resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [i]}])
-        for tag in resp["Tags"]:
-            if tag["Key"] == "Name":
-                return tag["Value"]
+        resp = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [i]}, {"Name": "key", "Values": ["Name"]}])
+        for t in resp["Tags"]:
+            if t["Key"] == "Name":
+                return t["Value"]
         return i
     except:
         return i
 
-# --------------------------------------------------------------------
-# EC2 Monitoring – Fixed for GitHub Actions (no PageSize!)
-# --------------------------------------------------------------------
+# ===================================================================
+# EC2 MONITORING – Fixed 100% false disk alerts
+# ===================================================================
 def monitor_ec2():
     print(f"\nEC2 Monitoring — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     now = datetime.datetime.now(pytz.UTC)
     start = now - datetime.timedelta(hours=6)
 
-    # Get ALL disk_used_percent metrics without PageSize (GH Actions fix)
+    # Get ALL CWAgent disk metrics (manual pagination – works everywhere)
     all_metrics = []
     token = None
     while True:
         kwargs = {"Namespace": "CWAgent", "MetricName": "disk_used_percent"}
-        if token:
-            kwargs["NextToken"] = token
+        if token: kwargs["NextToken"] = token
         resp = cw.list_metrics(**kwargs)
         all_metrics.extend(resp.get("Metrics", []))
         token = resp.get("NextToken")
-        if not token:
-            break
+        if not token: break
 
     for inst_id in INSTANCES:
         name = get_name(inst_id)
@@ -78,20 +73,24 @@ def monitor_ec2():
             resp = cw.get_metric_statistics(
                 Namespace="AWS/EC2", MetricName="CPUUtilization",
                 Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-                StartTime=start, EndTime=now, Period=300, Statistics=["Maximum"]
+                StartTime=start, EndTime=now, Period=300, Statistics=["Average"]
             )
-            cpu = max([p["Maximum"] for p in resp.get("Datapoints", [])]) if resp.get("Datapoints") else None
+            points = resp.get("Datapoints", [])
+            cpu = max([p["Average"] for p in points]) if points else None
             if cpu:
-                if cpu > CPU_THRESHOLD:
-                    print(f" CPU: {cpu:.1f}% → HIGH CPU")
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Status": f"{cpu:.1f}%"})
+                if cpu >= CPU_CRIT:
+                    print(f" CPU: {cpu:.1f}% → CRITICAL CPU")
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "CRITICAL CPU"})
+                elif cpu >= CPU_WARN:
+                    print(f" CPU: {cpu:.1f}% → WARNING CPU")
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "WARNING CPU"})
                 else:
-                    print(f" CPU: {cpu:.1f}% → CPU OK")
+                    print(f" CPU: {cpu:.1f}% → Healthy CPU")
             else:
                 print(" CPU: No data")
         except: print(" CPU: Error")
 
-        # Disk – now works 100%
+        # DISK – Now uses AVERAGE (not Maximum) → no more fake 100%!
         disks = []
         for m in all_metrics:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
@@ -107,94 +106,102 @@ def monitor_ec2():
                 stats = cw.get_metric_statistics(
                     Namespace="CWAgent", MetricName="disk_used_percent",
                     Dimensions=m["Dimensions"],
-                    StartTime=start, EndTime=now, Period=300, Statistics=["Maximum"]
+                    StartTime=start, EndTime=now, Period=300, Statistics=["Average"]
                 )
-                if stats.get("Datapoints"):
-                    usage = max(p["Maximum"] for p in stats["Datapoints"])
-                    disks.append((path, usage))
+                points = stats.get("Datapoints", [])
+                if points:
+                    avg = sum(p["Average"] for p in points) / len(points)
+                    disks.append((path, round(avg, 1)))
             except:
                 pass
 
         if disks:
             disks.sort(key=lambda x: x[1], reverse=True)
             path, usage = disks[0]
-            others = f" (+{len(disks)-1})" if len(disks) > 1 else ""
-            if usage > DISK_THRESHOLD:
-                print(f" Disk ({path}): {usage:.1f}%%{others} → HIGH DISK")
-                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"{path}: {usage:.1f}%"})
+            others = f" (+{len(disks)-1} mounts)" if len(disks) > 1 else ""
+            if usage >= DISK_CRIT:
+                print(f" Disk ({path}): {usage}%{others} → CRITICAL DISK")
+                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "CRITICAL DISK"})
+            elif usage >= DISK_WARN:
+                print(f" Disk ({path}): {usage}%{others} → WARNING DISK")
+                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "WARNING DISK"})
             else:
-                print(f" Disk ({path}): {usage:.1f}%%{others} → Disk OK")
+                print(f" Disk ({path}): {usage}%{others} → Healthy Disk")
         else:
-            print(" Disk: No metrics (agent not configured?)")
+            print(" Disk: No metrics")
 
         print()
 
-# --------------------------------------------------------------------
-# Elastic Beanstalk – Skips suspended ones
-# --------------------------------------------------------------------
+# ===================================================================
+# EB + FOTA + PRETTY SUMMARY
+# ===================================================================
 def monitor_eb():
     print(f"Elastic Beanstalk — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     try:
-        envs = eb.describe_environments()["Environments"]
-        for e in envs:
-            name = e["EnvironmentName"]
-            if name in SKIP_EB:
-                print(f"Skipped: {name} (suspended)")
+        for env in eb.describe_environments()["Environments"]:
+            n = env["EnvironmentName"]
+            if n in SKIP_EB:
+                print(f"Skipped: {n} (suspended)")
                 continue
-            health = e.get("Health", "Unknown")
-            status = e.get("Status", "")
-            if health != "Green" or status in ["Suspended", "Terminating"]:
-                print(f"Unhealthy: {name} → {health} ({status})")
-                issues.append({"Type": "EB", "Name": name, "Metric": "Health", "Status": f"{health}/{status}"})
+            h = env.get("Health", "Unknown")
+            s = env.get("Status", "")
+            if h != "Green" or s in ["Suspended", "Terminating"]:
+                print(f"Unhealthy: {n} → {h} ({s})")
+                issues.append({"Type": "EB", "Name": n, "Metric": "Health", "Value": f"{h}/{s}", "Status": "Unhealthy EB"})
             else:
-                print(f"Healthy: {name}")
+                print(f"Healthy: {n}")
     except Exception as e:
         print(f"EB Error: {e}")
 
-# --------------------------------------------------------------------
-# FOTA API
-# --------------------------------------------------------------------
 def check_fota():
-    print(f"\nFOTA API — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    print(f"\nFOTA API Check — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     try:
         r = requests.get("https://fota.kazam.in/time", timeout=10)
         if r.status_code == 200 and r.text.strip().isdigit():
             print("FOTA API Healthy")
         else:
-            print("FOTA API Invalid response")
-            issues.append({"Type": "FOTA", "Name": "API", "Metric": "Status", "Status": "Invalid"})
+            print("FOTA API Down")
+            issues.append({"Type": "FOTA", "Name": "API", "Metric": "Status", "Value": "Down", "Status": "FOTA Down"})
     except Exception as e:
-        print(f"FOTA API Failed: {e}")
-        issues.append({"Type": "FOTA", "Name": "API", "Metric": "Error", "Status": str(e)})
+        print(f"FOTA Failed: {e}")
+        issues.append({"Type": "FOTA", "Name": "API", "Metric": "Error", "Value": str(e), "Status": "FOTA Error"})
 
-# --------------------------------------------------------------------
-# Summary + SNS
-# --------------------------------------------------------------------
-def summary():
-    print("\n" + "═" * 70)
-    print(" " * 25 + "ISSUES SUMMARY")
-    print("═" * 70)
+def print_summary():
+    print("\n" + "═" * 80)
+    print(" " * 30 + "HEALTH SUMMARY")
+    print("═" * 80)
+
     if not issues:
-        print("   ALL SYSTEMS HEALTHY – NO ISSUES DETECTED!")
-    else:
-        print(tabulate(
-            [[i["Type"], i["Name"], i["Metric"], i["Status"]] for i in issues],
-            headers=["Type", "Name", "Metric", "Status"],
-            tablefmt="grid"
-        ))
-    print()
+        print("       ALL SYSTEMS HEALTHY – NO ISSUES!")
+        print("═" * 80)
+        return
+
+    # Beautiful table with emojis
+    rows = []
+    for i in issues:
+        status = i["Status"]
+        if "CRITICAL" in status:
+            emoji = "CRITICAL"
+        elif "WARNING" in status or "Unhealthy" in status or "Down" in status:
+            emoji = "WARNING"
+        else:
+            emoji = "Healthy"
+        rows.append([emoji, i["Type"], i["Name"], i["Metric"], i["Value"]])
+
+    print(tabulate(rows, headers=["Status", "Type", "Name", "Metric", "Details"], tablefmt="simple", stralign="left"))
+    print("═" * 80)
 
 def send_sns():
-    subject = f"{'CRITICAL' if issues else 'INFO'} AWS Monitoring – {len(issues)} issue(s)"
+    subject = f"{'CRITICAL' if any('CRITICAL' in i['Status'] for i in issues) else 'WARNING' if issues else 'INFO'} AWS Health Check – {len(issues)} issue(s)"
     try:
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=buf.getvalue())
-        print(f"SNS sent → {subject}\n")
+        print(f"\nSNS sent → {subject}\n")
     except Exception as e:
         print(f"SNS failed: {e}\n")
 
-# --------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------
+# ===================================================================
+# MAIN
+# ===================================================================
 if __name__ == "__main__":
     buf = StringIO()
     sys.stdout = buf
@@ -202,7 +209,7 @@ if __name__ == "__main__":
     monitor_eb()
     monitor_ec2()
     check_fota()
-    summary()
+    print_summary()
 
     sys.stdout = sys.__stdout__
     print(buf.getvalue())
