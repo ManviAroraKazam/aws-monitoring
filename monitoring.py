@@ -111,7 +111,7 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching CPU: {e}")
 
-        # --- Memory (Fully Dynamic CWAgent detection, no dimension filter) ---
+        # --- Memory (Dynamic CWAgent metric detection) ---
         try:
             mem_found = False
             metric_list = cw.list_metrics(
@@ -136,26 +136,35 @@ def monitor_ec2():
                         mem = max(p["Maximum"] for p in points)
                         print(f"  Memory Usage: {mem:.1f}%")
                         if mem > MEMORY_THRESHOLD:
-                            issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.1f}%)"})
+                            issues.append({
+                                "Type": "EC2",
+                                "Name": name,
+                                "Metric": "Memory",
+                                "Status": f"High ({mem:.1f}%)"
+                            })
                         else:
                             print("  ✅ Memory OK")
                         mem_found = True
                         break
+
             if not mem_found:
                 print("  ⚠ No Memory data available")
+
         except Exception as e:
             print(f"⚠ Error fetching memory: {e}")
 
-        # --- Disk (Dynamic CWAgent detection) ---
+        # --- Disk (Smart Dynamic CWAgent detection across all mounts) ---
         try:
             metric_list = cw.list_metrics(
                 Namespace="CWAgent",
                 MetricName="disk_used_percent"
             )
-            disk_found = False
+
+            disk_values = []
+
             for metric in metric_list.get("Metrics", []):
                 dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
-                if dims.get("InstanceId") == inst_id and dims.get("path") == "/":
+                if dims.get("InstanceId") == inst_id:
                     disk_data = cw.get_metric_statistics(
                         Namespace="CWAgent",
                         MetricName="disk_used_percent",
@@ -167,16 +176,26 @@ def monitor_ec2():
                     )
                     points = disk_data.get("Datapoints", [])
                     if points:
-                        disk = max(p["Maximum"] for p in points)
-                        print(f"  Disk Usage: {disk:.1f}%")
-                        if disk > DISK_THRESHOLD:
-                            issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"High ({disk:.1f}%)"})
-                        else:
-                            print("  ✅ Disk OK")
-                        disk_found = True
-                        break
-            if not disk_found:
+                        usage = max(p["Maximum"] for p in points)
+                        path = dims.get("path", "unknown")
+                        disk_values.append((path, usage))
+
+            if disk_values:
+                # pick the highest usage (worst case)
+                top_path, top_usage = sorted(disk_values, key=lambda x: x[1], reverse=True)[0]
+                print(f"  Disk Usage ({top_path}): {top_usage:.1f}%")
+                if top_usage > DISK_THRESHOLD:
+                    issues.append({
+                        "Type": "EC2",
+                        "Name": name,
+                        "Metric": "Disk",
+                        "Status": f"High ({top_usage:.1f}%)"
+                    })
+                else:
+                    print("  ✅ Disk OK")
+            else:
                 print("  ⚠ No Disk data available")
+
         except Exception as e:
             print(f"⚠ Error fetching disk: {e}")
 
