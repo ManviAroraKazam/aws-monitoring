@@ -2,7 +2,10 @@ name: AWS Monitor
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every minute for testing
+    - cron: "10 4 * * *"   # 9:40 AM IST
+    - cron: "10 9 * * *"   # 2:40 PM IST
+    - cron: "10 12 * * *"  # 5:40 PM IST
+    - cron: "10 17 * * *"  # 10:40 PM IST
 
 jobs:
   monitor:
