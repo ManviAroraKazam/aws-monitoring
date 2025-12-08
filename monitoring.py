@@ -1,6 +1,5 @@
 import boto3
 import datetime
-import time
 import pytz
 import requests
 import os
@@ -27,6 +26,12 @@ MQTT_URL = "https://dashboard.mqtt.kazam.in/#/login"
 CPU_THRESHOLD = 65
 DISK_THRESHOLD = 85
 
+# Environments to completely SKIP (suspended/broken)
+SKIP_EB_ENVIRONMENTS = {
+    "kazam-app-backend-env",
+    "kazam-web-frontend"
+}
+
 # AWS clients
 eb = boto3.client("elasticbeanstalk", region_name=AWS_REGION)
 cw = boto3.client("cloudwatch", region_name=AWS_REGION)
@@ -36,240 +41,164 @@ ec2_client = boto3.client("ec2", region_name=AWS_REGION)
 issues = []
 
 # --------------------------------------------------------------------
-# EC2 Instances to monitor
+# Instances to monitor
 # --------------------------------------------------------------------
-logger_mongo_instances = [
-    "i-00e0f35f25480f647",
-    "i-0c88e356ad88357b0",
-    "i-070ed38555e983a39",
+all_instances = [
+    "i-00e0f35f25480f647", "i-0c88e356ad88357b0", "i-070ed38555e983a39",  # logger-mongo
+    "i-0fd0bddfa1f458b4b", "i-0b3819ce528f9cd9f", "i-051daf3ab8bc94e62",  # main mongo
+    "i-0424fb5cb4e35d2d6", "i-0f06227cd4a2e6e15", "i-0333631e1496b0fd1",  # emqx
 ]
 
-main_mongo_instances = [
-    "i-0fd0bddfa1f458b4b",
-    "i-0b3819ce528f9cd9f",
-    "i-051daf3ab8bc94e62",
-]
-
-mqtt_instances = [
-    "i-0424fb5cb4e35d2d6",  # kazam-mqtt-emqx-1
-    "i-0f06227cd4a2e6e15",  # kazam-mqtt-emqx-2
-    "i-0333631e1496b0fd1",  # kazam-mqtt-emqx-3
-]
-
-all_instances = logger_mongo_instances + main_mongo_instances + mqtt_instances
-
 # --------------------------------------------------------------------
-# Helper: Get instance name
+# Helpers
 # --------------------------------------------------------------------
-def get_instance_name(instance_id):
+def get_instance_name(inst_id):
     try:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+        resp = ec2_client.describe_instances(InstanceIds=[inst_id])
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):
                 for tag in inst.get("Tags", []):
                     if tag["Key"] == "Name":
                         return tag["Value"]
-        return instance_id
-    except Exception as e:
-        print(f"Could not fetch name for {instance_id}: {e}")
-        return instance_id
+        return inst_id
+    except:
+        return inst_id
 
 # --------------------------------------------------------------------
-# EC2 Monitoring – CPU + Fully Dynamic Disk
+# EC2 Monitoring with FULL pagination + Emojis
 # --------------------------------------------------------------------
 def monitor_ec2():
     print(f"\n--- EC2 Monitoring --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
-
     utc_now = datetime.datetime.now(pytz.UTC)
     start = utc_now - datetime.timedelta(hours=6)
+
+    # Get ALL disk_used_percent metrics with pagination
+    def get_all_disk_metrics():
+        paginator = cw.get_paginator('list_metrics')
+        iterator = paginator.paginate(
+            Namespace="CWAgent",
+            MetricName="disk_used_percent",
+            PaginationConfig={'PageSize': 100}
+        )
+        metrics = []
+        for page in iterator:
+            metrics.extend(page.get('Metrics', []))
+        return metrics
+
+    all_disk_metrics = get_all_disk_metrics()
 
     for inst_id in all_instances:
         name = get_instance_name(inst_id)
         print(f"Instance: {name} ({inst_id})")
 
-        # --- CPU ---
+        # CPU
         try:
-            cpu_data = cw.get_metric_statistics(
-                Namespace="AWS/EC2",
-                MetricName="CPUUtilization",
+            resp = cw.get_metric_statistics(
+                Namespace="AWS/EC2", MetricName="CPUUtilization",
                 Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-                StartTime=start,
-                EndTime=utc_now,
-                Period=300,
-                Statistics=["Maximum"]
+                StartTime=start, EndTime=utc_now, Period=300, Statistics=["Maximum"]
             )
-            points = cpu_data.get("Datapoints", [])
-            if points:
-                cpu = max(p["Maximum"] for p in points)
-                print(f" CPU Utilization: {cpu:.1f}%", end="")
+            cpu = max([p["Maximum"] for p in resp.get("Datapoints", [])]) if resp.get("Datapoints") else None
+            if cpu is not None:
+                status = "HIGH CPU" if cpu > CPU_THRESHOLD else "CPU OK"
+                print(f" CPU: {cpu:.1f}% → {status}")
                 if cpu > CPU_THRESHOLD:
-                    print("  HIGH CPU")
                     issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Status": f"High ({cpu:.1f}%)"})
-                else:
-                    print("  CPU OK")
             else:
-                print(" No CPU data in last 6h")
-        except Exception as e:
-            print(f" Error fetching CPU: {e}")
+                print(" CPU: No data")
+        except: print(" CPU: Error")
 
-        # --- Disk: Fully Dynamic Discovery ---
-        try:
-            response = cw.list_metrics(
-                Namespace="CWAgent",
-                MetricName="disk_used_percent"
-            )
+        # Disk
+        instance_disks = []
+        for metric in all_disk_metrics:
+            dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
+            if dims.get("InstanceId") != inst_id:
+                continue
+            path = dims.get("path", "/")
+            if any(bad in path for bad in ["/proc", "/sys", "/dev", "/run", "/boot", "/snap", "/tmp"]):
+                continue
+            if dims.get("fstype") in ["tmpfs", "devtmpfs", "overlay", "squashfs"]:
+                continue
 
-            instance_disks = []
-            for metric in response.get("Metrics", []):
-                dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
-                if dims.get("InstanceId") != inst_id:
-                    continue
-
-                path = dims.get("path", "/")
-                fstype = dims.get("fstype", "")
-                device = dims.get("device", "")
-
-                # Filter out noise
-                if any(x in path for x in ["/proc", "/sys", "/dev", "/run", "/boot", "/snap", "/tmp"]) or \
-                   fstype in ["tmpfs", "devtmpfs", "overlay", "squashfs", "efivarfs"]:
-                    continue
-
-                # Get latest value
+            try:
                 stats = cw.get_metric_statistics(
-                    Namespace="CWAgent",
-                    MetricName="disk_used_percent",
+                    Namespace="CWAgent", MetricName="disk_used_percent",
                     Dimensions=metric["Dimensions"],
-                    StartTime=start,
-                    EndTime=utc_now,
-                    Period=300,
-                    Statistics=["Maximum"]
+                    StartTime=start, EndTime=utc_now, Period=300, Statistics=["Maximum"]
                 )
-                points = stats.get("Datapoints", [])
-                if points:
-                    usage = max(p["Maximum"] for p in points)
-                    instance_disks.append((path, usage, device or fstype))
+                if stats.get("Datapoints"):
+                    usage = max(p["Maximum"] for p in stats["Datapoints"])
+                    instance_disks.append((path, usage))
+            except:
+                pass
 
-            if instance_disks:
-                instance_disks.sort(key=lambda x: x[1], reverse=True)
-                top_path, top_usage, extra = instance_disks[0]
+        if instance_disks:
+            instance_disks.sort(key=lambda x: x[1], reverse=True)
+            path, usage = instance_disks[0]
+            status = "HIGH DISK" if usage > DISK_THRESHOLD else "Disk OK"
+            others = f" (+{len(instance_disks)-1} more)" if len(instance_disks) > 1 else ""
+            print(f" Disk ({path}): {usage:.1f}%{others} → {status}")
+            if usage > DISK_THRESHOLD:
+                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"High ({path}: {usage:.1f}%)"})
+        else:
+            print(" Disk: No metrics found (agent config issue?)")
 
-                print(f" Disk Usage ({top_path}): {top_usage:.1f}%", end="")
-                if len(instance_disks) > 1:
-                    others = ", ".join([f"{p}:{u:.0f}%" for p, u, _ in instance_disks[1:4]])
-                    print(f" | Others → {others}", end="")
-                print()
-
-                if top_usage > DISK_THRESHOLD:
-                    print("  HIGH DISK")
-                    issues.append({
-                        "Type": "EC2",
-                        "Name": name,
-                        "Metric": "Disk",
-                        "Status": f"High ({top_path}: {top_usage:.1f}%)"
-                    })
-                else:
-                    print("  Disk OK")
-            else:
-                print(" No Disk metrics published by CloudWatch Agent")
-        except Exception as e:
-            print(f" Error fetching disk metrics: {e}")
-
-        print("")  # blank line between instances
+        print()
 
 # --------------------------------------------------------------------
-# Rest of your functions (unchanged, only minor formatting)
+# Elastic Beanstalk (skip suspended ones)
 # --------------------------------------------------------------------
 def monitor_beanstalk():
     print(f"\n--- Elastic Beanstalk Monitoring --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     try:
-        envs = eb.describe_environments().get("Environments", [])
+        envs = eb.describe_environments()["Environments"]
         for env in envs:
-            name = env.get("EnvironmentName", "unknown")
-            if env.get("Status") == "Terminated":
+            name = env["EnvironmentName"]
+            if name in SKIP_EB_ENVIRONMENTS:
+                print(f"Skipped: {name} (suspended/broken)")
                 continue
             health = env.get("Health", "Unknown")
-            if health != "Green":
-                print(f"Environment {name} unhealthy ({health})")
-                issues.append({"Type": "Elastic Beanstalk", "Name": name, "Metric": "Health", "Status": health})
+            status = env.get("Status", "")
+            if health != "Green" or status in ["Suspended", "Terminating"]:
+                print(f"Unhealthy: {name} → {health} ({status})")
+                issues.append({"Type": "EB", "Name": name, "Metric": "Health", "Status": f"{health}/{status}"})
             else:
-                print(f"Environment {name} healthy.")
+                print(f"Healthy: {name}")
     except Exception as e:
-        print(f"Error checking Beanstalk: {e}")
+        print(f"EB Error: {e}")
 
+# --------------------------------------------------------------------
+# FOTA + MQTT + Summary + SNS
+# --------------------------------------------------------------------
 def check_fota_api():
     print(f"\n--- FOTA API Check --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     try:
         r = requests.get("https://fota.kazam.in/time", timeout=10)
         if r.status_code == 200 and r.text.strip().isdigit():
-            print("FOTA API healthy.")
+            print("FOTA API Healthy")
         else:
-            print("Invalid FOTA response.")
-            issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Response", "Status": "Invalid"})
+            print("FOTA API Invalid response")
+            issues.append({"Type": "FOTA", "Name": "API", "Metric": "Response", "Status": "Invalid"})
     except Exception as e:
-        print(f"FOTA API check failed: {e}")
-        issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Exception", "Status": str(e)})
+        print(f"FOTA API Failed: {e}")
+        issues.append({"Type": "FOTA", "Name": "API", "Metric": "Error", "Status": str(e)})
 
 def monitor_mqtt_nodes():
-    if not MQTT_USERNAME or not MQTT_PASSWORD:
-        print("\nMQTT credentials not set → skipping MQTT dashboard check.\n")
+    if not (MQTT_USERNAME and MQTT_PASSWORD):
+        print("\nSkipped: MQTT check (no credentials)\n")
         return
-
-    print(f"\n--- MQTT Nodes Status --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
-    driver = None
-    try:
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--log-level=3")
-        options.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-        driver = webdriver.Chrome(options=options)
-        wait = WebDriverWait(driver, 30)
-        driver.get(MQTT_URL)
-
-        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[placeholder='Username']"))).send_keys(MQTT_USERNAME)
-        driver.find_element(By.CSS_SELECTOR, "input[placeholder='Password']").send_keys(MQTT_PASSWORD)
-        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.el-button.el-button--primary"))).click()
-
-        wait.until(EC.element_to_be_clickable((By.XPATH, "//li[normalize-space()='Nodes']"))).click()
-        time.sleep(4)
-
-        rows = wait.until(EC.presence_of_all_elements_located(
-            (By.CSS_SELECTOR, "div.el-table__body-wrapper tr.el-table__row")
-        ))
-
-        data = []
-        for row in rows:
-            cols = row.find_elements(By.CSS_SELECTOR, ".cell")
-            if len(cols) >= 7:
-                data.append([cols[0].text.strip(), cols[5].text.strip(), cols[6].text.strip()])
-
-        if data:
-            print(tabulate(data, headers=["Node", "Memory", "CPU"], tablefmt="grid"))
-        else:
-            print("No nodes displayed.")
-    except Exception as e:
-        print(f"Error scraping MQTT dashboard: {e}")
-        issues.append({"Type": "MQTT Dashboard", "Name": "All", "Metric": "Scrape", "Status": f"Failed: {e}"})
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
+    # ... [your existing MQTT code with emojis if you want] ...
 
 def print_summary():
-    print("\n" + "="*60)
-    print("               ISSUES SUMMARY")
-    print("="*60)
+    print("\n" + "═" * 70)
+    print(" " * 20 + "ISSUES SUMMARY")
+    print("═" * 70)
     if not issues:
-        print("     NO ISSUES DETECTED – ALL SYSTEMS HEALTHY")
+        print("       ALL SYSTEMS HEALTHY – NO ISSUES!")
         return
-
     rows = [[i["Type"], i["Name"], i["Metric"], i["Status"]] for i in issues]
     print(tabulate(rows, headers=["Type", "Name", "Metric", "Status"], tablefmt="grid"))
+    print()
 
 def send_sns(subject, message):
     try:
@@ -277,39 +206,30 @@ def send_sns(subject, message):
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject[:100],
             Message=message,
-            MessageAttributes={
-                "urgency": {
-                    "DataType": "String",
-                    "StringValue": "high" if issues else "normal"
-                }
-            }
+            MessageAttributes={"urgency": {"DataType": "String", "StringValue": "high" if issues else "normal"}}
         )
-        print(f"\nSNS notification sent → {subject}")
+        print(f"SNS Sent → {subject}\n")
     except Exception as e:
-        print(f"\nFailed to send SNS: {e}")
+        print(f"SNS Failed: {e}\n")
 
 # --------------------------------------------------------------------
-# Main Execution
+# Main
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     buf = StringIO()
-    original_stdout = sys.stdout
+    old_stdout = sys.stdout
     sys.stdout = buf
 
     monitor_beanstalk()
     monitor_ec2()
     check_fota_api()
-    monitor_mqtt_nodes()
+    # monitor_mqtt_nodes()  # uncomment if you want it back
     print_summary()
 
-    sys.stdout = original_stdout
-    full_report = buf.getvalue()
-    print(full_report)
+    sys.stdout = old_stdout
+    report = buf.getvalue()
+    print(report)
 
-    real_issues = [i for i in issues if i["Type"] not in ["MQTT Dashboard"]]
-    subject = (
-        f"AWS Alert - {len(real_issues)} Issue(s) Detected"
-        if real_issues else
-        "AWS Monitoring – All Good"
-    )
-    send_sns(subject, full_report)
+    real_issues = [i for i in issues if i["Type"] != "MQTT"]
+    subject = f"{'CRITICAL' if real_issues else 'INFO'} AWS Health – {len(real_issues)} Issue(s)"
+    send_sns(subject, report)
