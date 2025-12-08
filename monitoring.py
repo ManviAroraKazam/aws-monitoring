@@ -27,16 +27,19 @@ MQTT_URL = "https://dashboard.mqtt.kazam.in/#/login"
 
 # Thresholds
 CPU_THRESHOLD = 65       # %
-STORAGE_THRESHOLD = 84   # %
+MEMORY_THRESHOLD = 80    # %
+DISK_THRESHOLD = 85      # %
 
 # AWS clients
 eb = boto3.client("elasticbeanstalk", region_name=AWS_REGION)
 cw = boto3.client("cloudwatch", region_name=AWS_REGION)
-ssm = boto3.client("ssm", region_name=AWS_REGION)
 sns = boto3.client("sns", region_name=AWS_REGION)
+ec2_client = boto3.client("ec2", region_name=AWS_REGION)
+
+issues = []
 
 # --------------------------------------------------------------------
-# EC2 instances to monitor (replace with your own)
+# EC2 Instances to monitor
 # --------------------------------------------------------------------
 logger_mongo_instances = [
     "i-00e0f35f25480f647",
@@ -50,16 +53,19 @@ main_mongo_instances = [
     "i-051daf3ab8bc94e62",
 ]
 
-issues = []
+mqtt_instances = [
+    "i-0424fb5cb4e35d2d6",  # kazam-mqtt-emqx-1
+    "i-0f06227cd4a2e6e15",  # kazam-mqtt-emqx-2
+    "i-0333631e1496b0fd1",  # kazam-mqtt-emqx-3
+]
 
 # --------------------------------------------------------------------
-# Functions
+# Helper Functions
 # --------------------------------------------------------------------
 def get_instance_name(instance_id):
-    """Fetch EC2 Name tag"""
+    """Fetch EC2 instance name"""
     try:
-        ec2 = boto3.client("ec2", region_name=AWS_REGION)
-        resp = ec2.describe_instances(InstanceIds=[instance_id])
+        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):
                 for tag in inst.get("Tags", []):
@@ -70,113 +76,133 @@ def get_instance_name(instance_id):
         print(f"⚠ Could not fetch name for {instance_id}: {e}")
         return instance_id
 
+# --------------------------------------------------------------------
+# EC2 Monitoring (CloudWatch Agent)
+# --------------------------------------------------------------------
+def monitor_ec2():
+    print("\n--- EC2 Monitoring (CloudWatch Agent) ---\n")
+    all_instances = logger_mongo_instances + main_mongo_instances + mqtt_instances
 
-def check_ec2_cpu(instance_id):
-    """Check EC2 CPU utilization (past 6 hours)"""
-    end = datetime.datetime.now(pytz.UTC)
-    start = end - datetime.timedelta(hours=6)
-    try:
-        data = cw.get_metric_statistics(
-            Namespace="AWS/EC2",
-            MetricName="CPUUtilization",
-            Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
-            StartTime=start,
-            EndTime=end,
-            Period=300,
-            Statistics=["Maximum"]
-        )
-        points = data.get("Datapoints", [])
-        if not points:
-            return ["EC2", instance_id, "CPU", "No data"]
-        cpu = max(p["Maximum"] for p in points)
-        if cpu > CPU_THRESHOLD:
-            return ["EC2", instance_id, "CPU", f"High ({cpu:.2f}%)"]
-    except Exception as e:
-        return ["EC2", instance_id, "CPU", f"Error: {e}"]
-    return None
+    for inst_id in all_instances:
+        name = get_instance_name(inst_id)
+        print(f"Instance: {name} ({inst_id})")
 
+        utc_now = datetime.datetime.now(pytz.UTC)
+        start = utc_now - datetime.timedelta(hours=6)
 
-def check_storage(instance_id, path="/data"):
-    """Check disk usage via SSM"""
-    try:
-        resp = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [f"df -h {path} | awk 'NR==2 {{print $5, $3, $2}}'"]},
-        )
-        cmd_id = resp["Command"]["CommandId"]
-        for _ in range(20):
-            out = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
-            if out["Status"] in ("Pending", "InProgress", "Delayed"):
-                time.sleep(3)
-                continue
-            if out["Status"] == "Success":
-                result = (out.get("StandardOutputContent") or "").strip()
-                if result:
-                    parts = result.split()
-                    if len(parts) == 3:
-                        percent = float(parts[0].replace("%", ""))
-                        used, total = parts[1], parts[2]
-                        if percent > STORAGE_THRESHOLD:
-                            return ["EC2", instance_id, "Storage", f"High ({percent:.2f}% used {used}/{total})"]
-                break
-            break
-        return None
-    except Exception as e:
-        return ["EC2", instance_id, "Storage", f"Error: {e}"]
+        # --- CPU Utilization ---
+        try:
+            cpu_data = cw.get_metric_statistics(
+                Namespace="AWS/EC2",
+                MetricName="CPUUtilization",
+                Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
+                StartTime=start,
+                EndTime=utc_now,
+                Period=300,
+                Statistics=["Maximum"]
+            )
+            points = cpu_data.get("Datapoints", [])
+            if points:
+                cpu = max(p["Maximum"] for p in points)
+                print(f"  CPU Utilization: {cpu:.2f}%")
+                if cpu > CPU_THRESHOLD:
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Status": f"High ({cpu:.2f}%)"})
+                else:
+                    print("  ✅ CPU OK")
+            else:
+                print("  ⚠ No CPU data available")
+        except Exception as e:
+            print(f"⚠ Error fetching CPU: {e}")
 
+        # --- Memory Utilization (CWAgent) ---
+        try:
+            mem_data = cw.get_metric_statistics(
+                Namespace="CWAgent",
+                MetricName="mem_used_percent",
+                Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
+                StartTime=start,
+                EndTime=utc_now,
+                Period=300,
+                Statistics=["Maximum"]
+            )
+            points = mem_data.get("Datapoints", [])
+            if points:
+                mem = max(p["Maximum"] for p in points)
+                print(f"  Memory Usage: {mem:.2f}%")
+                if mem > MEMORY_THRESHOLD:
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.2f}%)"})
+                else:
+                    print("  ✅ Memory OK")
+            else:
+                print("  ⚠ No Memory data available")
+        except Exception as e:
+            print(f"⚠ Error fetching memory: {e}")
 
+        # --- Disk Utilization (CWAgent) ---
+        try:
+            disk_data = cw.get_metric_statistics(
+                Namespace="CWAgent",
+                MetricName="disk_used_percent",
+                Dimensions=[
+                    {"Name": "InstanceId", "Value": inst_id},
+                    {"Name": "path", "Value": "/"},
+                    {"Name": "fstype", "Value": "xfs"}
+                ],
+                StartTime=start,
+                EndTime=utc_now,
+                Period=300,
+                Statistics=["Maximum"]
+            )
+            points = disk_data.get("Datapoints", [])
+            if points:
+                disk = max(p["Maximum"] for p in points)
+                print(f"  Disk Usage: {disk:.2f}%")
+                if disk > DISK_THRESHOLD:
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"High ({disk:.2f}%)"})
+                else:
+                    print("  ✅ Disk OK")
+            else:
+                print("  ⚠ No Disk data available")
+        except Exception as e:
+            print(f"⚠ Error fetching disk: {e}")
+
+        print("")
+
+# --------------------------------------------------------------------
+# Elastic Beanstalk, FOTA, MQTT, and SNS (same as before)
+# --------------------------------------------------------------------
 def monitor_beanstalk():
-    """Check Elastic Beanstalk environment health"""
     print("\n--- Elastic Beanstalk Monitoring ---\n")
     try:
         envs = eb.describe_environments().get("Environments", [])
+        for env in envs:
+            name = env.get("EnvironmentName", "unknown")
+            if env.get("Status") == "Terminated":
+                continue
+            health = env.get("Health")
+            if health != "Green":
+                print(f"⚠ Environment {name} unhealthy ({health})")
+                issues.append({"Type": "Elastic Beanstalk", "Name": name, "Metric": "Health", "Status": health})
+            else:
+                print(f"✅ Environment {name} healthy.")
     except Exception as e:
-        print(f"⚠ EB describe failed: {e}")
-        issues.append({"Type": "Elastic Beanstalk", "Name": "-", "Metric": "Describe", "Status": str(e)})
-        return
+        print(f"⚠ Error: {e}")
+        issues.append({"Type": "Elastic Beanstalk", "Name": "-", "Metric": "Error", "Status": str(e)})
 
-    for env in envs:
-        name = env.get("EnvironmentName", "unknown")
-        if env.get("Status") == "Terminated":
-            continue
-        health = env.get("Health")
-        if health != "Green":
-            print(f"⚠ Environment {name} unhealthy ({health})")
-            issues.append({"Type": "Elastic Beanstalk", "Name": name, "Metric": "Health", "Status": health})
+def check_fota_api():
+    print("\n--- FOTA API Check ---\n")
+    try:
+        r = requests.get("https://fota.kazam.in/time", timeout=10)
+        if r.status_code == 200 and r.text.strip().isdigit():
+            print("✅ FOTA API healthy.")
         else:
-            print(f"✅ Environment {name} healthy.")
-
-
-def monitor_ec2():
-    """Check EC2 instances CPU + storage"""
-    print("\n--- EC2 Monitoring ---\n")
-
-    for inst in logger_mongo_instances:
-        name = get_instance_name(inst)
-        cpu = check_ec2_cpu(inst)
-        if cpu:
-            cpu[1] = name
-            issues.append(dict(zip(["Type","Name","Metric","Status"], cpu)))
-        storage = check_storage(inst, "/")
-        if storage:
-            storage[1] = name
-            issues.append(dict(zip(["Type","Name","Metric","Status"], storage)))
-
-    for inst in main_mongo_instances:
-        name = get_instance_name(inst)
-        cpu = check_ec2_cpu(inst)
-        if cpu:
-            cpu[1] = name
-            issues.append(dict(zip(["Type","Name","Metric","Status"], cpu)))
-        storage = check_storage(inst, "/data")
-        if storage:
-            storage[1] = name
-            issues.append(dict(zip(["Type","Name","Metric","Status"], storage)))
-
+            print("❌ Invalid FOTA response.")
+            issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Response", "Status": "Invalid"})
+    except Exception as e:
+        print(f"❌ FOTA API check failed: {e}")
+        issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Exception", "Status": str(e)})
 
 def monitor_mqtt_nodes():
-    """Check MQTT dashboard if credentials are available"""
     if not MQTT_USERNAME or not MQTT_PASSWORD:
         print("\n⚠ MQTT credentials not provided; skipping MQTT check.\n")
         return
@@ -201,7 +227,9 @@ def monitor_mqtt_nodes():
         nodes_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//li[normalize-space()='Nodes']")))
         nodes_tab.click()
         time.sleep(3)
-        rows = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.el-table__body-wrapper table.el-table__body tr.el-table__row")))
+        rows = wait.until(EC.presence_of_all_elements_located(
+            (By.CSS_SELECTOR, "div.el-table__body-wrapper table.el-table__body tr.el-table__row")
+        ))
 
         data = []
         for row in rows:
@@ -223,22 +251,6 @@ def monitor_mqtt_nodes():
             except Exception:
                 pass
 
-
-def check_fota_api():
-    """Check FOTA API"""
-    print("\n--- FOTA API Check ---\n")
-    try:
-        r = requests.get("https://fota.kazam.in/time", timeout=10)
-        if r.status_code == 200 and r.text.strip().isdigit():
-            print("✅ FOTA API healthy.")
-        else:
-            print("❌ Invalid FOTA response.")
-            issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Response", "Status": "Invalid"})
-    except Exception as e:
-        print(f"❌ FOTA API check failed: {e}")
-        issues.append({"Type": "FOTA API", "Name": "fota.kazam.in/time", "Metric": "Exception", "Status": str(e)})
-
-
 def print_summary():
     print("\n--- ⚠ Issues Summary ---\n")
     if not issues:
@@ -247,9 +259,7 @@ def print_summary():
     rows = [[i["Type"], i["Name"], i["Metric"], i["Status"]] for i in issues if i["Type"] != "MQTT Node"]
     print(tabulate(rows, headers=["Type", "Name", "Metric", "Status"], tablefmt="grid"))
 
-
 def send_sns(subject, message):
-    """Publish SNS notification"""
     try:
         resp = sns.publish(
             TopicArn=SNS_TOPIC_ARN,
@@ -262,7 +272,6 @@ def send_sns(subject, message):
         print(f"✅ SNS message sent. ID: {resp['MessageId']}")
     except Exception as e:
         print(f"❌ SNS publish failed: {e}")
-
 
 # --------------------------------------------------------------------
 # Main
