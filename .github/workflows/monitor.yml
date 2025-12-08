@@ -1,8 +1,9 @@
 name: AWS Monitor
 
 on:
-  schedule:
-    - cron: "*/1 * * * *"
+    schedule:
+        - cron: "*/5 * * * *"   # every 5 minutes for testing
+    
 
 jobs:
   monitor:
