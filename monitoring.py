@@ -80,7 +80,7 @@ def get_instance_name(instance_id):
 # EC2 Monitoring (CloudWatch Agent)
 # --------------------------------------------------------------------
 def monitor_ec2():
-    print("\n--- EC2 Monitoring (CloudWatch Agent) ---\n")
+    print(f"\n--- EC2 Monitoring (CloudWatch Agent) --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     all_instances = logger_mongo_instances + main_mongo_instances + mqtt_instances
 
     for inst_id in all_instances:
@@ -104,9 +104,9 @@ def monitor_ec2():
             points = cpu_data.get("Datapoints", [])
             if points:
                 cpu = max(p["Maximum"] for p in points)
-                print(f"  CPU Utilization: {cpu:.2f}%")
+                print(f"  CPU Utilization: {cpu:.1f}%")
                 if cpu > CPU_THRESHOLD:
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Status": f"High ({cpu:.2f}%)"})
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Status": f"High ({cpu:.1f}%)"})
                 else:
                     print("  ✅ CPU OK")
             else:
@@ -128,9 +128,9 @@ def monitor_ec2():
             points = mem_data.get("Datapoints", [])
             if points:
                 mem = max(p["Maximum"] for p in points)
-                print(f"  Memory Usage: {mem:.2f}%")
+                print(f"  Memory Usage: {mem:.1f}%")
                 if mem > MEMORY_THRESHOLD:
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.2f}%)"})
+                    issues.append({"Type": "EC2", "Name": name, "Metric": "Memory", "Status": f"High ({mem:.1f}%)"})
                 else:
                     print("  ✅ Memory OK")
             else:
@@ -138,31 +138,38 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching memory: {e}")
 
-        # --- Disk Utilization (CWAgent) ---
+        # --- Disk Utilization (Dynamic CWAgent Detection) ---
         try:
-            disk_data = cw.get_metric_statistics(
+            metric_list = cw.list_metrics(
                 Namespace="CWAgent",
                 MetricName="disk_used_percent",
-                Dimensions=[
-                    {"Name": "InstanceId", "Value": inst_id},
-                    {"Name": "path", "Value": "/"},
-                    {"Name": "device", "Value": "xvda1"},
-                    {"Name": "fstype", "Value": "xfs"}
-                ],
-                StartTime=start,
-                EndTime=utc_now,
-                Period=300,
-                Statistics=["Maximum"]
+                Dimensions=[{"Name": "InstanceId", "Value": inst_id}]
             )
-            points = disk_data.get("Datapoints", [])
-            if points:
-                disk = max(p["Maximum"] for p in points)
-                print(f"  Disk Usage: {disk:.2f}%")
-                if disk > DISK_THRESHOLD:
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"High ({disk:.2f}%)"})
-                else:
-                    print("  ✅ Disk OK")
-            else:
+
+            disk_found = False
+            for metric in metric_list.get("Metrics", []):
+                dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
+                if dims.get("path") == "/":
+                    disk_data = cw.get_metric_statistics(
+                        Namespace="CWAgent",
+                        MetricName="disk_used_percent",
+                        Dimensions=metric["Dimensions"],
+                        StartTime=start,
+                        EndTime=utc_now,
+                        Period=300,
+                        Statistics=["Maximum"]
+                    )
+                    points = disk_data.get("Datapoints", [])
+                    if points:
+                        disk = max(p["Maximum"] for p in points)
+                        print(f"  Disk Usage: {disk:.1f}%")
+                        if disk > DISK_THRESHOLD:
+                            issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Status": f"High ({disk:.1f}%)"})
+                        else:
+                            print("  ✅ Disk OK")
+                        disk_found = True
+                        break
+            if not disk_found:
                 print("  ⚠ No Disk data available")
         except Exception as e:
             print(f"⚠ Error fetching disk: {e}")
@@ -170,10 +177,10 @@ def monitor_ec2():
         print("")
 
 # --------------------------------------------------------------------
-# Elastic Beanstalk, FOTA, MQTT, and SNS (same as before)
+# Elastic Beanstalk, FOTA, MQTT, and SNS
 # --------------------------------------------------------------------
 def monitor_beanstalk():
-    print("\n--- Elastic Beanstalk Monitoring ---\n")
+    print(f"\n--- Elastic Beanstalk Monitoring --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     try:
         envs = eb.describe_environments().get("Environments", [])
         for env in envs:
@@ -191,7 +198,7 @@ def monitor_beanstalk():
         issues.append({"Type": "Elastic Beanstalk", "Name": "-", "Metric": "Error", "Status": str(e)})
 
 def check_fota_api():
-    print("\n--- FOTA API Check ---\n")
+    print(f"\n--- FOTA API Check --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     try:
         r = requests.get("https://fota.kazam.in/time", timeout=10)
         if r.status_code == 200 and r.text.strip().isdigit():
@@ -207,13 +214,16 @@ def monitor_mqtt_nodes():
     if not MQTT_USERNAME or not MQTT_PASSWORD:
         print("\n⚠ MQTT credentials not provided; skipping MQTT check.\n")
         return
-    print("\n--- MQTT Nodes Status ---\n")
+    print(f"\n--- MQTT Nodes Status --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
     driver = None
     try:
         options = webdriver.ChromeOptions()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--log-level=3")
+        options.add_experimental_option("excludeSwitches", ["enable-logging"])
         driver = webdriver.Chrome(options=options)
         wait = WebDriverWait(driver, 30)
         driver.get(MQTT_URL)
