@@ -25,7 +25,6 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 MQTT_URL = "https://dashboard.mqtt.kazam.in/#/login"
 
 CPU_THRESHOLD = 65
-MEMORY_THRESHOLD = 80
 DISK_THRESHOLD = 85
 
 # AWS clients
@@ -74,7 +73,7 @@ def get_instance_name(instance_id):
         return instance_id
 
 # --------------------------------------------------------------------
-# EC2 Monitoring (Dynamic CloudWatch Agent detection)
+# EC2 Monitoring (CPU + Disk Only)
 # --------------------------------------------------------------------
 def monitor_ec2():
     print(f"\n--- EC2 Monitoring (CloudWatch Agent) --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
@@ -111,49 +110,7 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching CPU: {e}")
 
-        # --- Memory (Dynamic Detection) ---
-        try:
-            mem_metrics = cw.list_metrics(
-                Namespace="CWAgent",
-                MetricName="mem_used_percent"
-            )
-            mem_found = False
-
-            for metric in mem_metrics.get("Metrics", []):
-                dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
-                if dims.get("InstanceId") == inst_id:
-                    mem_data = cw.get_metric_statistics(
-                        Namespace="CWAgent",
-                        MetricName="mem_used_percent",
-                        Dimensions=metric["Dimensions"],
-                        StartTime=start,
-                        EndTime=utc_now,
-                        Period=300,
-                        Statistics=["Maximum"]
-                    )
-                    points = mem_data.get("Datapoints", [])
-                    if points:
-                        mem = max(p["Maximum"] for p in points)
-                        print(f"  Memory Usage: {mem:.1f}%")
-                        if mem > MEMORY_THRESHOLD:
-                            issues.append({
-                                "Type": "EC2",
-                                "Name": name,
-                                "Metric": "Memory",
-                                "Status": f"High ({mem:.1f}%)"
-                            })
-                        else:
-                            print("  ✅ Memory OK")
-                        mem_found = True
-                        break
-
-            if not mem_found:
-                print("  ⚠ No Memory data available")
-
-        except Exception as e:
-            print(f"⚠ Error fetching memory: {e}")
-
-        # --- Disk (Ultra Dynamic Detection) ---
+        # --- Disk (Dynamic Detection) ---
         try:
             disk_metrics = cw.list_metrics(
                 Namespace="CWAgent",
@@ -165,6 +122,7 @@ def monitor_ec2():
                 dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
                 if dims.get("InstanceId") == inst_id:
                     path = dims.get("path", "")
+                    # Skip unimportant or ephemeral mounts
                     if any(path.startswith(x) for x in ["/proc", "/dev", "/sys", "/run", "/boot", "/snap"]):
                         continue
 
@@ -183,8 +141,9 @@ def monitor_ec2():
                         valid_disks.append((path or "unknown", usage))
 
             if valid_disks:
+                # Prioritize known data paths
                 preferred = None
-                for path in ["/data", "/", "/mnt"]:
+                for path in ["/data", "/", "/mnt", "/log"]:
                     for p, val in valid_disks:
                         if p == path:
                             preferred = (p, val)
@@ -214,7 +173,7 @@ def monitor_ec2():
         print("")
 
 # --------------------------------------------------------------------
-# Elastic Beanstalk, FOTA, MQTT, and SNS
+# Elastic Beanstalk, FOTA, MQTT, SNS
 # --------------------------------------------------------------------
 def monitor_beanstalk():
     print(f"\n--- Elastic Beanstalk Monitoring --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
