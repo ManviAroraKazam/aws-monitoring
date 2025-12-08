@@ -74,7 +74,7 @@ def get_instance_name(instance_id):
         return instance_id
 
 # --------------------------------------------------------------------
-# EC2 Monitoring (CloudWatch Agent)
+# EC2 Monitoring (Dynamic CloudWatch Agent detection)
 # --------------------------------------------------------------------
 def monitor_ec2():
     print(f"\n--- EC2 Monitoring (CloudWatch Agent) --- [{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] ---\n")
@@ -111,15 +111,15 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching CPU: {e}")
 
-        # --- Memory (Dynamic CWAgent metric detection) ---
+        # --- Memory (Dynamic Detection) ---
         try:
-            mem_found = False
-            metric_list = cw.list_metrics(
+            mem_metrics = cw.list_metrics(
                 Namespace="CWAgent",
                 MetricName="mem_used_percent"
             )
+            mem_found = False
 
-            for metric in metric_list.get("Metrics", []):
+            for metric in mem_metrics.get("Metrics", []):
                 dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
                 if dims.get("InstanceId") == inst_id:
                     mem_data = cw.get_metric_statistics(
@@ -153,18 +153,21 @@ def monitor_ec2():
         except Exception as e:
             print(f"⚠ Error fetching memory: {e}")
 
-        # --- Disk (Smart Dynamic CWAgent detection across all mounts) ---
+        # --- Disk (Ultra Dynamic Detection) ---
         try:
-            metric_list = cw.list_metrics(
+            disk_metrics = cw.list_metrics(
                 Namespace="CWAgent",
                 MetricName="disk_used_percent"
             )
+            valid_disks = []
 
-            disk_values = []
-
-            for metric in metric_list.get("Metrics", []):
+            for metric in disk_metrics.get("Metrics", []):
                 dims = {d["Name"]: d["Value"] for d in metric["Dimensions"]}
                 if dims.get("InstanceId") == inst_id:
+                    path = dims.get("path", "")
+                    if any(path.startswith(x) for x in ["/proc", "/dev", "/sys", "/run", "/boot", "/snap"]):
+                        continue
+
                     disk_data = cw.get_metric_statistics(
                         Namespace="CWAgent",
                         MetricName="disk_used_percent",
@@ -177,12 +180,21 @@ def monitor_ec2():
                     points = disk_data.get("Datapoints", [])
                     if points:
                         usage = max(p["Maximum"] for p in points)
-                        path = dims.get("path", "unknown")
-                        disk_values.append((path, usage))
+                        valid_disks.append((path or "unknown", usage))
 
-            if disk_values:
-                # pick the highest usage (worst case)
-                top_path, top_usage = sorted(disk_values, key=lambda x: x[1], reverse=True)[0]
+            if valid_disks:
+                preferred = None
+                for path in ["/data", "/", "/mnt"]:
+                    for p, val in valid_disks:
+                        if p == path:
+                            preferred = (p, val)
+                            break
+                    if preferred:
+                        break
+                if not preferred:
+                    preferred = sorted(valid_disks, key=lambda x: x[1], reverse=True)[0]
+
+                top_path, top_usage = preferred
                 print(f"  Disk Usage ({top_path}): {top_usage:.1f}%")
                 if top_usage > DISK_THRESHOLD:
                     issues.append({
