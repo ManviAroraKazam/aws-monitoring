@@ -49,11 +49,10 @@ def get_name(i):
 # EC2 MONITORING – Fixed 100% false disk alerts
 # ===================================================================
 def monitor_ec2():
-    print(f"\nEC2 Monitoring — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    print(f"\n🖥️  EC2 Monitoring — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     now = datetime.datetime.now(pytz.UTC)
     start = now - datetime.timedelta(hours=6)
 
-    # Get ALL CWAgent disk metrics (manual pagination – works everywhere)
     all_metrics = []
     token = None
     while True:
@@ -79,18 +78,19 @@ def monitor_ec2():
             cpu = max([p["Average"] for p in points]) if points else None
             if cpu:
                 if cpu >= CPU_CRIT:
-                    print(f" CPU: {cpu:.1f}% → CRITICAL CPU")
+                    print(f" ⚠️ CPU: {cpu:.1f}% → CRITICAL CPU")
                     issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "CRITICAL CPU"})
                 elif cpu >= CPU_WARN:
-                    print(f" CPU: {cpu:.1f}% → WARNING CPU")
+                    print(f" 🟠 CPU: {cpu:.1f}% → WARNING CPU")
                     issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "WARNING CPU"})
                 else:
-                    print(f" CPU: {cpu:.1f}% → Healthy CPU")
+                    print(f" ✅ CPU: {cpu:.1f}% → Healthy CPU")
             else:
-                print(" CPU: No data")
-        except: print(" CPU: Error")
+                print(" ⚪ CPU: No data")
+        except:
+            print(" ❌ CPU: Error")
 
-        # DISK – Now uses AVERAGE (not Maximum) → no more fake 100%!
+        # DISK
         disks = []
         for m in all_metrics:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
@@ -120,15 +120,15 @@ def monitor_ec2():
             path, usage = disks[0]
             others = f" (+{len(disks)-1} mounts)" if len(disks) > 1 else ""
             if usage >= DISK_CRIT:
-                print(f" Disk ({path}): {usage}%{others} → CRITICAL DISK")
+                print(f" 🔴 Disk ({path}): {usage}%{others} → CRITICAL DISK")
                 issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "CRITICAL DISK"})
             elif usage >= DISK_WARN:
-                print(f" Disk ({path}): {usage}%{others} → WARNING DISK")
+                print(f" 🟠 Disk ({path}): {usage}%{others} → WARNING DISK")
                 issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "WARNING DISK"})
             else:
-                print(f" Disk ({path}): {usage}%{others} → Healthy Disk")
+                print(f" ✅ Disk ({path}): {usage}%{others} → Healthy Disk")
         else:
-            print(" Disk: No metrics")
+            print(" ⚪ Disk: No metrics")
 
         print()
 
@@ -136,68 +136,73 @@ def monitor_ec2():
 # EB + FOTA + PRETTY SUMMARY
 # ===================================================================
 def monitor_eb():
-    print(f"Elastic Beanstalk — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    print(f"\n🌱 Elastic Beanstalk — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     try:
         for env in eb.describe_environments()["Environments"]:
             n = env["EnvironmentName"]
             if n in SKIP_EB:
-                print(f"Skipped: {n} (suspended)")
+                print(f" ⏸️  Skipped: {n} (suspended)")
                 continue
             h = env.get("Health", "Unknown")
             s = env.get("Status", "")
             if h != "Green" or s in ["Suspended", "Terminating"]:
-                print(f"Unhealthy: {n} → {h} ({s})")
+                print(f" ⚠️ Unhealthy: {n} → {h} ({s})")
                 issues.append({"Type": "EB", "Name": n, "Metric": "Health", "Value": f"{h}/{s}", "Status": "Unhealthy EB"})
             else:
-                print(f"Healthy: {n}")
+                print(f" ✅ Healthy: {n}")
     except Exception as e:
-        print(f"EB Error: {e}")
+        print(f" ❌ EB Error: {e}")
 
 def check_fota():
-    print(f"\nFOTA API Check — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    print(f"\n🔗 FOTA API Check — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     try:
         r = requests.get("https://fota.kazam.in/time", timeout=10)
         if r.status_code == 200 and r.text.strip().isdigit():
-            print("FOTA API Healthy")
+            print(" ✅ FOTA API Healthy")
         else:
-            print("FOTA API Down")
+            print(" 🔴 FOTA API Down")
             issues.append({"Type": "FOTA", "Name": "API", "Metric": "Status", "Value": "Down", "Status": "FOTA Down"})
     except Exception as e:
-        print(f"FOTA Failed: {e}")
+        print(f" ❌ FOTA Failed: {e}")
         issues.append({"Type": "FOTA", "Name": "API", "Metric": "Error", "Value": str(e), "Status": "FOTA Error"})
 
+# ===================================================================
+# SUMMARY WITH EMOJIS
+# ===================================================================
 def print_summary():
     print("\n" + "═" * 80)
     print(" " * 30 + "HEALTH SUMMARY")
     print("═" * 80)
 
     if not issues:
-        print("       ALL SYSTEMS HEALTHY – NO ISSUES!")
+        print(" ✅ ALL SYSTEMS HEALTHY – NO ISSUES!")
         print("═" * 80)
         return
 
-    # Beautiful table with emojis
     rows = []
     for i in issues:
         status = i["Status"]
         if "CRITICAL" in status:
-            emoji = "CRITICAL"
+            emoji = "🔴"
         elif "WARNING" in status or "Unhealthy" in status or "Down" in status:
-            emoji = "WARNING"
+            emoji = "🟠"
         else:
-            emoji = "Healthy"
+            emoji = "✅"
         rows.append([emoji, i["Type"], i["Name"], i["Metric"], i["Value"]])
 
     print(tabulate(rows, headers=["Status", "Type", "Name", "Metric", "Details"], tablefmt="simple", stralign="left"))
     print("═" * 80)
 
+# ===================================================================
+# SNS
+# ===================================================================
 def send_sns():
     subject = f"{'CRITICAL' if any('CRITICAL' in i['Status'] for i in issues) else 'WARNING' if issues else 'INFO'} AWS Health Check – {len(issues)} issue(s)"
     try:
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=buf.getvalue())
-        print(f"\nSNS sent → {subject}\n")
+        print(f"\n📨 SNS sent → {subject}\n")
     except Exception as e:
-        print(f"SNS failed: {e}\n")
+        print(f"❌ SNS failed: {e}\n")
 
 # ===================================================================
 # MAIN
