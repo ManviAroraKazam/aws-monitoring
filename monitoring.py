@@ -20,6 +20,10 @@ CPU_CRIT = 80
 DISK_WARN = 80
 DISK_CRIT = 90
 
+# Monitoring time windows (in minutes)
+CPU_LOOKBACK_MINUTES = 5    # Last 5 minutes for CPU (recent spikes)
+DISK_LOOKBACK_MINUTES = 5   # Last 5 minutes for disk
+
 SKIP_EB = {"kazam-app-backend-env", "kazam-web-frontend"}
 
 eb = boto3.client("elasticbeanstalk", region_name=AWS_REGION)
@@ -46,13 +50,17 @@ def get_name(i):
         return i
 
 # ===================================================================
-# EC2 MONITORING – Fixed 100% false disk alerts
+# EC2 MONITORING – Fixed timing issues
 # ===================================================================
 def monitor_ec2():
     print(f"\n🖥️  EC2 Monitoring — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
     now = datetime.datetime.now(pytz.UTC)
-    start = now - datetime.timedelta(hours=6)
+    
+    # Separate time windows for different metrics
+    cpu_start = now - datetime.timedelta(minutes=CPU_LOOKBACK_MINUTES)
+    disk_start = now - datetime.timedelta(minutes=DISK_LOOKBACK_MINUTES)
 
+    # Pre-fetch all disk metrics once
     all_metrics = []
     token = None
     while True:
@@ -67,36 +75,71 @@ def monitor_ec2():
         name = get_name(inst_id)
         print(f"Instance: {name} ({inst_id})")
 
-        # CPU
+        # CPU - Using RECENT average, not 6-hour max!
         try:
             resp = cw.get_metric_statistics(
-                Namespace="AWS/EC2", MetricName="CPUUtilization",
+                Namespace="AWS/EC2", 
+                MetricName="CPUUtilization",
                 Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
-                StartTime=start, EndTime=now, Period=300, Statistics=["Average"]
+                StartTime=cpu_start, 
+                EndTime=now, 
+                Period=60,  # 1-minute granularity for 5-min window
+                Statistics=["Maximum"]  # Use MAX for spike detection
             )
             points = resp.get("Datapoints", [])
-            cpu = max([p["Average"] for p in points]) if points else None
-            if cpu:
+            
+            if points:
+                # Use MAX for immediate spike detection
+                cpu = max(p["Maximum"] for p in points)
+                
                 if cpu >= CPU_CRIT:
-                    print(f" ⚠️ CPU: {cpu:.1f}% → CRITICAL CPU")
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "CRITICAL CPU"})
+                    print(f" 🔴 CPU: {cpu:.1f}% (last 5 min peak) → CRITICAL CPU")
+                    issues.append({
+                        "Type": "EC2", 
+                        "Name": name, 
+                        "Metric": "CPU", 
+                        "Value": f"{cpu:.1f}%", 
+                        "Status": "CRITICAL CPU"
+                    })
                 elif cpu >= CPU_WARN:
-                    print(f" 🟠 CPU: {cpu:.1f}% → WARNING CPU")
-                    issues.append({"Type": "EC2", "Name": name, "Metric": "CPU", "Value": f"{cpu:.1f}%", "Status": "WARNING CPU"})
+                    print(f" 🟠 CPU: {cpu:.1f}% (last 5 min peak) → WARNING CPU")
+                    issues.append({
+                        "Type": "EC2", 
+                        "Name": name, 
+                        "Metric": "CPU", 
+                        "Value": f"{cpu:.1f}%", 
+                        "Status": "WARNING CPU"
+                    })
                 else:
-                    print(f" ✅ CPU: {cpu:.1f}% → Healthy CPU")
+                    print(f" ✅ CPU: {cpu:.1f}% (last 5 min peak) → Healthy CPU")
             else:
-                print(" ⚪ CPU: No data")
-        except:
-            print(" ❌ CPU: Error")
+                print(f" ⚪ CPU: No data in last {CPU_LOOKBACK_MINUTES} min")
+                issues.append({
+                    "Type": "EC2", 
+                    "Name": name, 
+                    "Metric": "CPU", 
+                    "Value": "No data", 
+                    "Status": "WARNING CPU"
+                })
+        except Exception as e:
+            print(f" ❌ CPU: Error - {e}")
+            issues.append({
+                "Type": "EC2", 
+                "Name": name, 
+                "Metric": "CPU", 
+                "Value": "Error", 
+                "Status": "WARNING CPU"
+            })
 
-        # DISK
+        # DISK - Using recent average
         disks = []
         for m in all_metrics:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             if dims.get("InstanceId") != inst_id:
                 continue
             path = dims.get("path", "/")
+            
+            # Skip system/temporary filesystems
             if any(x in path for x in ["/proc", "/sys", "/dev", "/run", "/boot", "/snap", "/tmp"]):
                 continue
             if dims.get("fstype") in ["tmpfs", "devtmpfs", "overlay"]:
@@ -104,14 +147,19 @@ def monitor_ec2():
 
             try:
                 stats = cw.get_metric_statistics(
-                    Namespace="CWAgent", MetricName="disk_used_percent",
+                    Namespace="CWAgent", 
+                    MetricName="disk_used_percent",
                     Dimensions=m["Dimensions"],
-                    StartTime=start, EndTime=now, Period=300, Statistics=["Average"]
+                    StartTime=disk_start, 
+                    EndTime=now, 
+                    Period=60,  # 1-minute granularity
+                    Statistics=["Maximum"]  # Use MAX for disk
                 )
                 points = stats.get("Datapoints", [])
                 if points:
-                    avg = sum(p["Average"] for p in points) / len(points)
-                    disks.append((path, round(avg, 1)))
+                    # Use max for consistency with CPU approach
+                    max_usage = max(p["Maximum"] for p in points)
+                    disks.append((path, round(max_usage, 1)))
             except:
                 pass
 
@@ -119,16 +167,29 @@ def monitor_ec2():
             disks.sort(key=lambda x: x[1], reverse=True)
             path, usage = disks[0]
             others = f" (+{len(disks)-1} mounts)" if len(disks) > 1 else ""
+            
             if usage >= DISK_CRIT:
                 print(f" 🔴 Disk ({path}): {usage}%{others} → CRITICAL DISK")
-                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "CRITICAL DISK"})
+                issues.append({
+                    "Type": "EC2", 
+                    "Name": name, 
+                    "Metric": "Disk", 
+                    "Value": f"{path}: {usage}%", 
+                    "Status": "CRITICAL DISK"
+                })
             elif usage >= DISK_WARN:
                 print(f" 🟠 Disk ({path}): {usage}%{others} → WARNING DISK")
-                issues.append({"Type": "EC2", "Name": name, "Metric": "Disk", "Value": f"{path}: {usage}%", "Status": "WARNING DISK"})
+                issues.append({
+                    "Type": "EC2", 
+                    "Name": name, 
+                    "Metric": "Disk", 
+                    "Value": f"{path}: {usage}%", 
+                    "Status": "WARNING DISK"
+                })
             else:
                 print(f" ✅ Disk ({path}): {usage}%{others} → Healthy Disk")
         else:
-            print(" ⚪ Disk: No metrics")
+            print(f" ⚪ Disk: No metrics in last {DISK_LOOKBACK_MINUTES} min")
 
         print()
 
@@ -147,7 +208,13 @@ def monitor_eb():
             s = env.get("Status", "")
             if h != "Green" or s in ["Suspended", "Terminating"]:
                 print(f" ⚠️ Unhealthy: {n} → {h} ({s})")
-                issues.append({"Type": "EB", "Name": n, "Metric": "Health", "Value": f"{h}/{s}", "Status": "Unhealthy EB"})
+                issues.append({
+                    "Type": "EB", 
+                    "Name": n, 
+                    "Metric": "Health", 
+                    "Value": f"{h}/{s}", 
+                    "Status": "Unhealthy EB"
+                })
             else:
                 print(f" ✅ Healthy: {n}")
     except Exception as e:
@@ -161,10 +228,22 @@ def check_fota():
             print(" ✅ FOTA API Healthy")
         else:
             print(" 🔴 FOTA API Down")
-            issues.append({"Type": "FOTA", "Name": "API", "Metric": "Status", "Value": "Down", "Status": "FOTA Down"})
+            issues.append({
+                "Type": "FOTA", 
+                "Name": "API", 
+                "Metric": "Status", 
+                "Value": "Down", 
+                "Status": "FOTA Down"
+            })
     except Exception as e:
         print(f" ❌ FOTA Failed: {e}")
-        issues.append({"Type": "FOTA", "Name": "API", "Metric": "Error", "Value": str(e), "Status": "FOTA Error"})
+        issues.append({
+            "Type": "FOTA", 
+            "Name": "API", 
+            "Metric": "Error", 
+            "Value": str(e), 
+            "Status": "FOTA Error"
+        })
 
 # ===================================================================
 # SUMMARY WITH EMOJIS
