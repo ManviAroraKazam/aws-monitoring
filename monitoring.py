@@ -15,14 +15,15 @@ SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
 if not SNS_TOPIC_ARN:
     raise RuntimeError("SNS_TOPIC_ARN not set!")
 
-CPU_WARN = 65
+# Match CloudWatch Alarm thresholds
+CPU_WARN = 70   # Match CloudWatch alarm threshold
 CPU_CRIT = 80
-DISK_WARN = 80
+DISK_WARN = 85  # Match CloudWatch alarm threshold  
 DISK_CRIT = 90
 
-# Monitoring time windows (in minutes)
-CPU_LOOKBACK_MINUTES = 5    # Last 5 minutes for CPU (recent spikes)
-DISK_LOOKBACK_MINUTES = 5   # Last 5 minutes for disk
+# Monitoring time windows - Match CloudWatch Alarms exactly
+CPU_LOOKBACK_MINUTES = 10    # Get 2 periods (2x5min) to ensure we have data
+DISK_LOOKBACK_MINUTES = 10   # Get 2 periods (2x5min) to ensure we have data
 
 SKIP_EB = {"kazam-app-backend-env", "kazam-web-frontend"}
 
@@ -50,7 +51,7 @@ def get_name(i):
         return i
 
 # ===================================================================
-# EC2 MONITORING – Fixed timing issues
+# EC2 MONITORING – Matches CloudWatch Alarm Configuration
 # ===================================================================
 def monitor_ec2():
     print(f"\n🖥️  EC2 Monitoring — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
@@ -75,7 +76,7 @@ def monitor_ec2():
         name = get_name(inst_id)
         print(f"Instance: {name} ({inst_id})")
 
-        # CPU - Using RECENT average, not 6-hour max!
+        # CPU - Match CloudWatch Alarm: 5-min period, Average statistic
         try:
             resp = cw.get_metric_statistics(
                 Namespace="AWS/EC2", 
@@ -83,17 +84,18 @@ def monitor_ec2():
                 Dimensions=[{"Name": "InstanceId", "Value": inst_id}],
                 StartTime=cpu_start, 
                 EndTime=now, 
-                Period=60,  # 1-minute granularity for 5-min window
-                Statistics=["Maximum"]  # Use MAX for spike detection
+                Period=300,  # 5-minute period (matches CloudWatch alarm)
+                Statistics=["Average"]  # Average statistic (matches CloudWatch alarm)
             )
             points = resp.get("Datapoints", [])
             
             if points:
-                # Use MAX for immediate spike detection
-                cpu = max(p["Maximum"] for p in points)
+                # Get the most recent 5-minute average (matches CloudWatch behavior)
+                sorted_points = sorted(points, key=lambda x: x["Timestamp"], reverse=True)
+                cpu = sorted_points[0]["Average"]  # Most recent 5-min average
                 
                 if cpu >= CPU_CRIT:
-                    print(f" 🔴 CPU: {cpu:.1f}% (last 5 min peak) → CRITICAL CPU")
+                    print(f" 🔴 CPU: {cpu:.1f}% (5-min avg) → CRITICAL CPU")
                     issues.append({
                         "Type": "EC2", 
                         "Name": name, 
@@ -102,7 +104,7 @@ def monitor_ec2():
                         "Status": "CRITICAL CPU"
                     })
                 elif cpu >= CPU_WARN:
-                    print(f" 🟠 CPU: {cpu:.1f}% (last 5 min peak) → WARNING CPU")
+                    print(f" 🟠 CPU: {cpu:.1f}% (5-min avg) → WARNING CPU")
                     issues.append({
                         "Type": "EC2", 
                         "Name": name, 
@@ -111,9 +113,9 @@ def monitor_ec2():
                         "Status": "WARNING CPU"
                     })
                 else:
-                    print(f" ✅ CPU: {cpu:.1f}% (last 5 min peak) → Healthy CPU")
+                    print(f" ✅ CPU: {cpu:.1f}% (5-min avg) → Healthy CPU")
             else:
-                print(f" ⚪ CPU: No data in last {CPU_LOOKBACK_MINUTES} min")
+                print(f" ⚪ CPU: No data in last 10 min")
                 issues.append({
                     "Type": "EC2", 
                     "Name": name, 
@@ -131,18 +133,23 @@ def monitor_ec2():
                 "Status": "WARNING CPU"
             })
 
-        # DISK - Using recent average
+        # DISK - Match CloudWatch Alarm: 5-min period, Average statistic
         disks = []
         for m in all_metrics:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             if dims.get("InstanceId") != inst_id:
                 continue
             path = dims.get("path", "/")
+            device = dims.get("device", "")
+            fstype = dims.get("fstype", "")
             
             # Skip system/temporary filesystems
             if any(x in path for x in ["/proc", "/sys", "/dev", "/run", "/boot", "/snap", "/tmp"]):
                 continue
-            if dims.get("fstype") in ["tmpfs", "devtmpfs", "overlay"]:
+            if fstype in ["tmpfs", "devtmpfs", "overlay", "squashfs"]:
+                continue
+            # Skip loop devices and docker overlays
+            if device.startswith("loop") or "overlay" in device:
                 continue
 
             try:
@@ -152,44 +159,45 @@ def monitor_ec2():
                     Dimensions=m["Dimensions"],
                     StartTime=disk_start, 
                     EndTime=now, 
-                    Period=60,  # 1-minute granularity
-                    Statistics=["Maximum"]  # Use MAX for disk
+                    Period=300,  # 5-minute period (matches CloudWatch alarm)
+                    Statistics=["Average"]  # Average statistic (matches CloudWatch alarm)
                 )
                 points = stats.get("Datapoints", [])
                 if points:
-                    # Use max for consistency with CPU approach
-                    max_usage = max(p["Maximum"] for p in points)
-                    disks.append((path, round(max_usage, 1)))
+                    # Get the most recent 5-minute average
+                    sorted_points = sorted(points, key=lambda x: x["Timestamp"], reverse=True)
+                    avg = sorted_points[0]["Average"]
+                    disks.append((path, round(avg, 1), device, fstype))
             except:
                 pass
 
         if disks:
             disks.sort(key=lambda x: x[1], reverse=True)
-            path, usage = disks[0]
+            path, usage, device, fstype = disks[0]
             others = f" (+{len(disks)-1} mounts)" if len(disks) > 1 else ""
             
             if usage >= DISK_CRIT:
-                print(f" 🔴 Disk ({path}): {usage}%{others} → CRITICAL DISK")
+                print(f" 🔴 Disk ({path}): {usage}% [{device}, {fstype}]{others} → CRITICAL DISK")
                 issues.append({
                     "Type": "EC2", 
                     "Name": name, 
                     "Metric": "Disk", 
-                    "Value": f"{path}: {usage}%", 
+                    "Value": f"{path}: {usage}% ({device})", 
                     "Status": "CRITICAL DISK"
                 })
             elif usage >= DISK_WARN:
-                print(f" 🟠 Disk ({path}): {usage}%{others} → WARNING DISK")
+                print(f" 🟠 Disk ({path}): {usage}% [{device}, {fstype}]{others} → WARNING DISK")
                 issues.append({
                     "Type": "EC2", 
                     "Name": name, 
                     "Metric": "Disk", 
-                    "Value": f"{path}: {usage}%", 
+                    "Value": f"{path}: {usage}% ({device})", 
                     "Status": "WARNING DISK"
                 })
             else:
-                print(f" ✅ Disk ({path}): {usage}%{others} → Healthy Disk")
+                print(f" ✅ Disk ({path}): {usage}% [{device}, {fstype}]{others} → Healthy Disk")
         else:
-            print(f" ⚪ Disk: No metrics in last {DISK_LOOKBACK_MINUTES} min")
+            print(f" ⚪ Disk: No metrics in last 10 min")
 
         print()
 
