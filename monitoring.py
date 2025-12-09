@@ -139,7 +139,8 @@ def monitor_ec2():
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             if dims.get("InstanceId") != inst_id:
                 continue
-            path = dims.get("path", "/")
+            
+            path = dims.get("path", "")
             device = dims.get("device", "")
             fstype = dims.get("fstype", "")
             
@@ -149,7 +150,11 @@ def monitor_ec2():
             if fstype in ["tmpfs", "devtmpfs", "overlay", "squashfs"]:
                 continue
             # Skip loop devices and docker overlays
-            if device.startswith("loop") or "overlay" in device:
+            if device.startswith("loop") or "overlay" in device.lower():
+                continue
+            
+            # Skip if path is empty
+            if not path:
                 continue
 
             try:
@@ -167,35 +172,49 @@ def monitor_ec2():
                     # Get the most recent 5-minute average
                     sorted_points = sorted(points, key=lambda x: x["Timestamp"], reverse=True)
                     avg = sorted_points[0]["Average"]
-                    disks.append((path, round(avg, 1), device, fstype))
+                    
+                    # Prefer root filesystem (/) or primary data mounts
+                    priority = 0
+                    if path == "/":
+                        priority = 3  # Highest priority for root
+                    elif path.startswith("/data"):
+                        priority = 2
+                    elif path.startswith("/mnt"):
+                        priority = 1
+                    
+                    disks.append((path, round(avg, 1), device, fstype, priority))
             except:
                 pass
 
         if disks:
-            disks.sort(key=lambda x: x[1], reverse=True)
-            path, usage, device, fstype = disks[0]
+            # Sort by priority first (highest first), then by usage (highest first)
+            disks.sort(key=lambda x: (x[4], x[1]), reverse=True)
+            path, usage, device, fstype, _ = disks[0]
             others = f" (+{len(disks)-1} mounts)" if len(disks) > 1 else ""
             
+            # Show device info if available
+            device_info = f" [{device}, {fstype}]" if device and fstype else ""
+            
             if usage >= DISK_CRIT:
-                print(f" 🔴 Disk ({path}): {usage}% [{device}, {fstype}]{others} → CRITICAL DISK")
+                print(f" 🔴 Disk ({path}): {usage}%{device_info}{others} → CRITICAL DISK")
                 issues.append({
                     "Type": "EC2", 
                     "Name": name, 
                     "Metric": "Disk", 
-                    "Value": f"{path}: {usage}% ({device})", 
+                    "Value": f"{path}: {usage}%{' (' + device + ')' if device else ''}", 
                     "Status": "CRITICAL DISK"
                 })
             elif usage >= DISK_WARN:
-                print(f" 🟠 Disk ({path}): {usage}% [{device}, {fstype}]{others} → WARNING DISK")
+                print(f" 🟠 Disk ({path}): {usage}%{device_info}{others} → WARNING DISK")
                 issues.append({
                     "Type": "EC2", 
                     "Name": name, 
                     "Metric": "Disk", 
-                    "Value": f"{path}: {usage}% ({device})", 
+                    "Value": f"{path}: {usage}%{' (' + device + ')' if device else ''}", 
                     "Status": "WARNING DISK"
                 })
             else:
-                print(f" ✅ Disk ({path}): {usage}% [{device}, {fstype}]{others} → Healthy Disk")
+                print(f" ✅ Disk ({path}): {usage}%{device_info}{others} → Healthy Disk")
         else:
             print(f" ⚪ Disk: No metrics in last 10 min")
 
